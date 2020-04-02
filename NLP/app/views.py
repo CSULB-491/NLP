@@ -1,27 +1,108 @@
 import os
 import requests
 from django.utils import timezone
-from django.urls import reverse_lazy
-from django.forms import inlineformset_factory
+from django.urls import reverse_lazy, reverse
 from google.cloud.language_v1 import enums
-from django.shortcuts import render, redirect, get_object_or_404
+from django.shortcuts import get_object_or_404
+from django.views.generic import ListView, DetailView, TemplateView
+from django.http import JsonResponse
+from django.contrib.auth.signals import user_logged_in, user_logged_out
+from django.dispatch import receiver
+from .static.python.nlp import NLP
+
 
 from django.views.generic.edit import (
-    FormView,
     CreateView,
     DeleteView,
     UpdateView,
 )
+from .models import (
+    Author,
+    Article,
+    Publisher,
+    Score,
+    Entity,
+    Category,
+    MetaData,
+    Knowledge,
+    User,
+    Profile,
+    RSSFeed,
+    Like,
+    Comment,
+    CommentForm,
+    Favorite,
+    Bookmark,
+    RSS,
+    SignUpForm,
+    UpdateProfileForm,
+)
 
-from django.views.generic import ListView, DetailView
-from chartjs.views.lines import BaseLineChartView
 
-from .models import Author, Article, Publisher, Score, Entity, Category, MetaData, Knowledge
-from .nlp import NLP
+# =========================
+# Base Views
+# =========================
+class IndexView(TemplateView):
+    template_name = "app/index.html"
 
-os.environ[
-    "GOOGLE_APPLICATION_CREDENTIALS"
-] = "/Users/spencerneveux/Desktop/FinalProject/NLP/NLP/app/api.json"
+
+class HomeView(ListView):
+    model = Article
+    template_name = "app/home.html"
+
+    def get_context_data(self, *, object_list=None, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['rssfeed_list'] = RSSFeed.objects.all()
+        return context
+
+# =========================
+# User
+# =========================
+class UserCreate(CreateView):
+    form_class = SignUpForm
+    template_name = "registration/signup.html"
+    success_url = reverse_lazy("login")
+
+
+# =========================
+# Account
+# =========================
+class AccountUpdate(UpdateView):
+    model = User
+    fields = ('email',)
+    success_url = reverse_lazy("account")
+    template_name = "app/account_form.html"
+
+    def get_success_url(self):
+        return reverse('account', kwargs={'pk': self.object.id})
+
+# =========================
+# Profile
+# =========================
+# TODO: fix all this nonsense
+class ProfileCreate(CreateView):
+    model = Profile
+    fields = "__all__"
+
+
+# =========================
+# RSS Feeds
+# =========================
+class RSSList(ListView):
+    model = RSSFeed
+
+# =========================
+# Comments
+# =========================
+class CommentCreateView(CreateView):
+    form_class = CommentForm
+    template_name = "app/comment_form.html"
+
+    def form_valid(self, form):
+        article = Article.objects.get(pk=self.kwargs['article_id'])
+        form.instance.user = self.request.user
+        form.instance.article = article
+        return super(CommentCreateView, self).form_valid(form)
 
 
 # =========================
@@ -30,9 +111,17 @@ os.environ[
 class ArticleList(ListView):
     model = Article
 
-
 class ArticleDetailView(DetailView):
     model = Article
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['comment_form'] = CommentForm
+        return context
+
+class ArticleScoreView(DetailView):
+    model = Article
+    template_name = "app/article_score.html"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -85,10 +174,36 @@ class ArticleCreate(CreateView):
 
             if entity.metadata:
                 if entity.metadata.get("wikipedia_url") and entity.metadata.get("mid"):
+                    
+                    # Knowledge base api call/handling
                     knowledge_results = requests.get("https://kgsearch.googleapis.com/v1/entities:search?ids=" + entity.metadata.get("mid") + "&key=AIzaSyBVWNLOTmBPy63hgF2ZgSLuOsFqFVRWSoQ&limit=1&indent=True")
-                    json_result = knowledge_results.json()
+                    json_results = knowledge_results.json().get('itemListElement')
+                    results = json_results[0]['result']
 
-                    print(json_result.get('itemListElement'))
+                    # Get values from request
+                    name = results.get('name')
+                    desc = results.get('description')
+                    image_details = results.get('image')
+                    desc_details = results.get('detailedDescription')
+                    url_details = results.get('url')
+
+                    if (image_details):
+                        image_content_url = image_details['contentUrl']
+                        image_url = image_details['url']
+
+                    # Get Detailed Description
+                    if (desc_details):
+                        article_body = desc_details['articleBody']
+                        article_url = desc_details['url']
+
+                    # Create Knowledge Model
+                    Knowledge.objects.create(
+                        entity_id=e.id,
+                        name=name,
+                        description=desc,
+                        url=article_url,
+                        article_body=article_body
+                    )
 
                     MetaData.objects.create(
                         entity_id=e.id,
@@ -200,14 +315,200 @@ class KnowledgeDetailView(DetailView):
 
 
 # =========================
-# Misc
+# Bookmarks
 # =========================
-class IndexView(ListView):
-    template_name = "app/index.html"
-    context_object_name = "article_list"
-    model = Article
+class BookmarkListView(ListView):
+    model = Bookmark
 
-    def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
-        context["score_list"] = Score.objects.order_by("magnitude")
-        return context
+# =========================
+# Utility 
+# =========================
+@receiver(user_logged_in)
+def got_online(sender, user, request, **kwargs):
+    user.profile.is_online = True
+    user.profile.save()
+
+@receiver(user_logged_out)
+def got_offline(sender, user, request, **kwargs):  
+    user.profile.is_online = False
+    user.profile.save()
+
+
+def like(request):
+    article_id = request.GET.get('article-id')
+    operation = request.GET.get('operation')
+
+    like, created = Like.objects.get_or_create(user=request.user, article_id=article_id)
+    if operation == "like":
+        like.is_liked = True
+        like.save()
+        data = {
+            'Test': 'Like'
+        }
+    elif operation == "dislike":
+        like.is_liked = False
+        like.save()
+        data = {
+            'Test': 'Dislike'
+        }
+
+    return JsonResponse(data)
+
+
+def favorite(request):
+    article_id = request.GET.get('article-id')
+    new_dislike, added = Favorite.objects.get_or_create(user=request.user, article_id=article_id)
+
+    if added:
+        data = {
+            'Test': True
+        }
+    else:
+        data = {
+            'Test': False
+        }
+
+    return JsonResponse(data)
+
+
+def bookmark(request):
+    article_id = request.GET.get('article-id')
+    bookmark, bookmarked = Bookmark.objects.get_or_create(user=request.user, article_id=article_id)
+    if not bookmark.is_bookmarked:
+        bookmark.is_bookmarked = True
+        bookmark.save()
+        data = {
+            'Test': True
+        }
+    else:
+        data = {
+            'Test': False
+        }
+
+    return JsonResponse(data)
+
+def remove_bookmark(request):
+    article_id = request.GET.get('article-id')
+    bookmark = Bookmark.objects.get(user=request.user, article_id=article_id)
+    print(bookmark.is_bookmarked)
+    if bookmark.is_bookmarked:
+        bookmark.is_bookmarked = False
+        bookmark.save()
+        data = {
+            'Test': True
+        }
+    else:
+        data = {
+            'Test': False
+        }
+
+    return JsonResponse(data)
+
+def add_rss_feed(request):
+    rss_id = request.GET.get('rss-id')
+
+    rss, added = RSS.objects.get_or_create(user=request.user, rss_id=rss_id)
+    print(rss.feed_added)
+
+    # Add feed if not added
+    if not rss.feed_added:
+        rss.feed_added = True
+        rss.feed_removed = False
+        rss.save()
+        data = {
+            'Test': True
+        }
+    else:
+        data = {
+            'Test': False
+        }
+
+    return JsonResponse(data)
+
+
+def remove_rss_feed(request):
+    rss_id = request.GET.get('rss-id')
+
+    rss, removed = RSS.objects.get_or_create(user=request.user, rss_id=rss_id)
+
+    # Remove feed if it has been added
+    if not rss.feed_removed:
+        rss.feed_added = False
+        rss.feed_removed = True
+        rss.save()
+        data = {
+            'Test': True
+        }
+    else:
+        data = {
+            'Test': False
+        }
+
+    return JsonResponse(data)
+
+
+def get_popular_rss_articles(request):
+    rss_id = request.GET.get('rss-id')
+    rss_feed = RSSFeed.objects.get(pk=rss_id)
+
+    if rss_feed:
+        article_list = rss_feed.get_popular_article_list()
+        article_data_list = []
+        article_stats = {}
+        for article in article_list:
+            article_data = {
+                'id': article.id,
+                'rss_feed_id': article.rss_feed_id,
+                'title': article.title,
+                'publisher': article.publisher,
+                'author': article.author,
+                'content': article.content,
+                'date': article.date
+            }
+            article_stats[article.id] = ('likes', article.get_likes(), 'comments', article.get_total_comments())
+            article_data_list.append(article_data)
+        data = {
+            'Test': True,
+            'article_list': article_data_list,
+            'article_stats': article_stats,
+        }
+    else:
+        data = {
+            'Test': False
+        }
+
+    return JsonResponse(data)
+
+
+def get_latest_rss_articles(request):
+    rss_id = request.GET.get('rss-id')
+    rss_feed = RSSFeed.objects.get(pk=rss_id)
+
+    if rss_feed:
+        article_list = rss_feed.get_latest_article_list()
+        article_data_list = []
+        article_stats = {}
+        for article in article_list:
+            article_data = {
+                'id': article.id,
+                'rss_feed_id': article.rss_feed_id,
+                'title': article.title,
+                'publisher': article.publisher,
+                'author': article.author,
+                'content': article.content,
+                'date': article.date
+            }
+            article_stats[article.id] = ('likes', article.get_likes(), 'comments', article.get_total_comments())
+            article_data_list.append(article_data)
+        data = {
+            'Test': True,
+            'article_list': article_data_list,
+            'article_stats': article_stats,
+        }
+    else:
+        data = {
+            'Test': False
+        }
+
+    return JsonResponse(data)
+

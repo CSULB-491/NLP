@@ -1,32 +1,140 @@
 from django.utils.timezone import now
+from django import forms
 from django.db import models
 from django.forms import ModelForm
 from django.urls import reverse
+from django.contrib.auth.models import User
+from django.contrib.auth.forms import UserCreationForm
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+
+# =========================
+# Profile
+# =========================
+class ProfileManager(models.Manager):
+    def create_profile(self, upload, description):
+        profile = self.create(
+            upload=upload, description=description
+        )
+
+
+class Profile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, primary_key=True)
+    email = models.EmailField(max_length=200, default="")
+    avatar = models.ImageField(upload_to="app/static/images", default="app/static/images/default.png")
+    description = models.CharField(max_length=200, default="", null=True)
+    is_online = models.BooleanField(default=False)
+    signup_confirmation = models.BooleanField(default=False)
+
+    # TODO: Need settings fields (dark mode,etc)
+    # TODO: Need additional rss feeds specific to user
+
+
+    def get_rss_list(self):
+        return self.user.rss_set.all()
+
+    def get_bookmarks(self):
+        return self.user.bookmark_set.all()
+
+    def get_bookmark_status(self):
+        bookmarks = self.user.bookmark_set.all()
+        return any(bookmark.is_bookmarked == True for bookmark in bookmarks)
+
+    def __str__(self):
+        return self.user.username
+
+    @receiver(post_save, sender=User)
+    def update_profile_signal(sender, instance, created, **kwargs):
+        if created:
+            Profile.objects.create(user=instance)
+        instance.profile.save()
+
+
+class SignUpForm(UserCreationForm):
+    first_name = forms.CharField(max_length=200, help_text='First Name')
+    last_name = forms.CharField(max_length=200, help_text='Last Name')
+    email = forms.EmailField(max_length=200, help_text='Email', required=True)
+    password1 = forms.PasswordInput()
+
+    class Meta: 
+        model = User
+        fields = (
+            'username',
+            'first_name',
+            'last_name',
+            'email',
+            'password1',
+            'password2'
+        )
+
+class UpdateProfileForm(ModelForm):
+    avatar = forms.ImageField()
+
+    class Meta:
+        model = Profile
+        fields = "__all__"
+
+# =========================
+# RSS Feed
+# =========================
+class RSSFeed(models.Model):
+    name = models.CharField(max_length=200, default="")
+    link = models.URLField(max_length=200, default="")
+
+    def get_article_list(self):
+        return self.article_set.all()
+
+    def get_popular_article_list(self):
+        return sorted(self.article_set.all(), key=lambda article:article.get_likes(), reverse=True)
+
+    def get_latest_article_list(self):
+        return sorted(self.article_set.all(), key=lambda article:article.date, reverse=True)
+
+    def __str__(self):
+        return self.name
 
 
 # =========================
 # Articles
 # =========================
 class ArticleManager(models.Manager):
-    def create_article(self, author, publisher, title, content):
+    def create_article(self, author, publisher, title, content, link):
         article = self.create(
-            author=author, publisher=publisher, title=title, content=content
+            author=author, publisher=publisher, title=title, content=content, link=link
         )
         return article
 
 
 class Article(models.Model):
     objects = ArticleManager()
-    author = models.CharField(max_length=200, default="")
-    publisher = models.CharField(max_length=200, default="")
+    rss_feed = models.ForeignKey(RSSFeed, on_delete=models.CASCADE, null=True)
+
     title = models.CharField(max_length=200, default="")
+    publisher = models.CharField(max_length=200, default="")
+    author = models.CharField(max_length=200, default="")
     content = models.TextField()
+    link = models.URLField(default="")
+    date = models.DateTimeField(default=now)
 
     def get_entities(self):
         return self.entity_set.all()
 
     def get_categories(self):
         return self.category_set.all()
+
+    def get_likes(self):
+        count = 0
+        for like in self.like_set.all():
+            if like.is_liked == True:
+                count += 1
+        return count
+
+    def get_comments(self):
+        return self.comments.all()
+
+    def get_total_comments(self):
+        return len(self.comments.all())
 
     def get_absolute_url(self):
         return reverse("article-detail", kwargs={"pk": self.pk})
@@ -53,7 +161,7 @@ class AuthorManager(models.Manager):
             name=author.name,
             number_articles=author.number_articles,
             social_media=author.social_media,
-            last_accessed=autho.last_accessed,
+            last_accessed=author.last_accessed,
         )
         return a
 
@@ -160,6 +268,9 @@ class Entity(models.Model):
     wiki = models.URLField(max_length=200, default="", null=True)
     mid = models.CharField(max_length=200, default="", null=True)
 
+    class Meta:
+        app_label = "app"
+
     def __str__(self):
         return self.name
 
@@ -176,7 +287,7 @@ class KnowledgeManager(models.Manager):
 class Knowledge(models.Model):
     entity = models.OneToOneField(Entity, on_delete=models.CASCADE, primary_key=True)
     name = models.CharField(max_length=200, default="")
-    description = models.CharField(max_length=200, default="")
+    description = models.CharField(max_length=200, default="", null=True)
     url = models.URLField(max_length=200, default="")
     article_body = models.TextField()
 
@@ -201,6 +312,86 @@ class Category(models.Model):
 
     def __str__(self):
         return self.name
+
+
+# =========================
+# Interactions
+# =========================
+class Like(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    article = models.ForeignKey(Article, on_delete=models.CASCADE)
+    date = models.DateTimeField(auto_now_add=True)
+    is_liked = models.BooleanField(default=False)
+
+
+class Comment(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    article = models.ForeignKey(Article, related_name='comments', on_delete=models.CASCADE)
+    parent = models.ForeignKey('self', null=True, blank=True, related_name='replies', on_delete=models.CASCADE)
+    date = models.DateTimeField(auto_now_add=True)
+    content = models.TextField(default="")
+
+    def get_absolute_url(self):
+        return reverse('article-detail', kwargs={'pk': self.article.pk})
+
+    def __str__(self):
+        return self.content
+
+class CommentForm(ModelForm):
+    class Meta:
+        model = Comment
+        fields = ('content',)
+
+class Favorite(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    article = models.ForeignKey(Article, on_delete=models.CASCADE)
+    date = models.DateTimeField(auto_now=True)
+
+
+class Bookmark(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    article = models.ForeignKey(Article, on_delete=models.CASCADE)
+    date = models.DateTimeField(auto_now=True)
+    description = models.CharField(max_length=200, default="")
+    is_bookmarked = models.BooleanField(default=False)
+
+    def get_is_bookmarked(self):
+        if self.is_bookmarked:
+            return True
+        else:
+            return False
+
+
+class RSS(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    rss = models.ForeignKey(RSSFeed, on_delete=models.CASCADE)
+    date = models.DateTimeField(auto_now=True)
+    feed_added = models.BooleanField(default=False)
+    feed_removed = models.BooleanField(default=True)
+
+    def get_rss_status(self):
+        if self.feed_added == True:
+            return True
+        else:
+            return False
+
+    def get_popular_article_list(self):
+        popular_articles = sorted(self.rss.get_article_list(), key=lambda article:article.get_total_comments())
+        return popular_articles
+
+    def __str__(self):
+        return self.rss.name
+
+# =========================
+# Status
+# =========================
+class Status(models.Manager):
+    article = models.OneToOneField(Article, on_delete=models.CASCADE, primary_key=True)
+    read = models.BooleanField(default=False)
+    bookmark = models.BooleanField(default=False)
+
+    def __str__(self):
+        return self.read
 
 
 # =========================
